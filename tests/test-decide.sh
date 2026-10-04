@@ -32,6 +32,9 @@ fail() {
 # shellcheck disable=SC1090
 source "$CLI"
 load_config
+CODEX_HOME_default="$TMP_ROOT/account"
+mkdir -p "$CODEX_HOME_default"
+printf '{"auth_mode":"chatgpt","tokens":{"account_id":"test"}}\n' > "$CODEX_HOME_default/auth.json"
 
 NOW="$(date +%s)"
 
@@ -45,10 +48,10 @@ read_limits() { printf '{"primary":{"usedPercent":100,"windowDurationMins":300,"
 OUT="$(decide_dry_run default 0)"
 echo "$OUT" | grep -q "would-ping default" || fail "expected would-ping for past resetsAt, got: $OUT"
 
-# 3: resetsAt null -> ping
+# 3: missing window metadata must not cause a blind ping
 read_limits() { printf '{"primary":{"usedPercent":0,"windowDurationMins":null,"resetsAt":null},"secondary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":null},"planType":"plus","limitName":null}\n'; }
 OUT="$(decide_dry_run default 0)"
-echo "$OUT" | grep -q "would-ping default" || fail "expected would-ping for null resetsAt, got: $OUT"
+echo "$OUT" | grep -q "would-backoff default" || fail "expected would-backoff for missing window data, got: $OUT"
 
 # 4: RPC read failure -> backoff
 read_limits() { return 1; }

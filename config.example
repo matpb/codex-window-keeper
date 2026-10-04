@@ -1,7 +1,8 @@
 CODEX_BIN=/usr/bin/codex           # install.sh resolves `command -v codex` and writes it (systemd PATH is minimal)
 MODEL=gpt-5.6-luna
 REASONING_EFFORT=low
-ACCOUNTS="default"                 # space-separated labels. "default" = unset CODEX_HOME. Any other label needs CODEX_HOME_<label>, e.g.:
+ACCOUNTS="default"                 # space-separated labels; default inherits CODEX_HOME unless pinned below
+# CODEX_HOME_default=$HOME/.codex  # pin manual commands and the scheduler to the same account
 # ACCOUNTS="default work"
 # CODEX_HOME_work=$HOME/.codex-work
 WINDOW_SECS=18000

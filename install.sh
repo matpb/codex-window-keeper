@@ -109,7 +109,7 @@ warn_missing_credentials() {
   IFS=' ' read -ra acc_arr <<< "$accounts"
   for label in "${acc_arr[@]+"${acc_arr[@]}"}"; do
     if [[ "$label" == "default" ]]; then
-      codex_home="${CODEX_HOME:-$HOME/.codex}"
+      codex_home="${CODEX_HOME_default:-${CODEX_HOME:-$HOME/.codex}}"
     else
       var="CODEX_HOME_$label"
       codex_home="${!var:-}"

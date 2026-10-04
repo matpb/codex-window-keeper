@@ -11,10 +11,11 @@ window. The window is not anchored to the wall clock, it is anchored to your fir
 request. So when you sit down to work after a break, the clock starts with you, and if
 you burn through the budget in three hours you wait two.
 
-This tool keeps a window open at all times. Every 10 minutes a timer checks whether a
-primary window is currently active. If one is not, it makes the cheapest possible Codex
-call to open one. Your own work keeps the window open the rest of the time, so the keeper
-only ever fires during the gaps.
+Every 10 minutes a timer checks the five-hour window. When it has expired, or successive
+zero-use snapshots show the reset sliding with query time, the keeper sends a small
+Codex request. A future reset time alone does not prove a window is open. Observing a
+new zero-use window can take two ticks (up to about 20 minutes after expiry while the
+machine is awake and reads succeed).
 
 ```
 Without:   you start 9:00 ... budget gone 12:00 ... wait ... new window 14:00
@@ -72,9 +73,10 @@ launchd agent on macOS.
 default    ACTIVE   resets=2026-01-01 12:00:00 (in 2h15m) used_pct=15 weekly_pct=40 plan=plus source=live last_ping=2026-01-01 09:45:00 last_result=ok
 ```
 
-On first run, before any ping, it will still show live numbers as long as the RPC read
-works — there is no `UNKNOWN` wait the way the Claude version has, since the read itself
-costs nothing.
+On first run, before any ping, it shows live numbers as long as the RPC read works.
+A zero-use window can show `OBSERVING` until successive snapshots distinguish a fixed
+reset from a sliding one. `UNCONFIRMED` means a request completed but the window is not
+yet confirmed; `EXHAUSTED` means a returned quota prevents an automatic ping.
 
 ## Requirements
 
@@ -128,23 +130,46 @@ CODEX_HOME_work=$HOME/.codex-work
 unset, meaning Codex uses `~/.codex`). Every other label needs a matching
 `CODEX_HOME_<label>`.
 
+To keep manual commands and the scheduler on the same account, set
+`CODEX_HOME_default=$HOME/.codex` in the keeper config. State is bound to the resolved
+directory and the account identity in `auth.json`. File-backed credentials are required;
+keychain-only accounts without this file report `UNKNOWN` and do not automatically ping.
+
 `RPC_TIMEOUT` bounds how long the free rate-limit read waits for a reply before giving up.
 `BACKOFF_SECS` is how long the keeper waits before retrying after a failed read or a
 failed ping, instead of assuming a fresh window it never actually earned.
 
 ## How it works
 
-Every 10 minutes the timer runs `tick`. For each account it does a free RPC read of the
-current rate limits. If a primary window is active, it skips. Otherwise it:
+Every tick selects the window with `windowDurationMins=300`, regardless of its position
+in the response. Nonzero usage with a future reset is active. For zero usage, snapshots
+5–20 minutes apart distinguish a fixed reset from one that keeps moving to query time
+plus five hours (60 seconds of tolerance). An ambiguous first snapshot is `OBSERVING`.
 
-1. Runs `codex exec --ephemeral` with the cheap model and a one-word prompt, opening a
-   fresh 5-hour window.
-2. Re-reads the rate limits (free again) to record the real reset time.
-3. Writes that to state — no session files or transcripts are left behind, because
-   `--ephemeral` never created any.
+When a window expires or a sliding zero-use reset is detected, the keeper runs
+`codex exec --ephemeral`, then re-reads limits. A completed request is `UNCONFIRMED`
+until usage or a later fixed countdown confirms the window. Until confirmed, successful
+automatic requests are limited to one every `WINDOW_SECS` (normally five hours). Once
+confirmed, the real reset time takes precedence, including an earlier expiry.
 
-If the RPC read itself fails, the keeper backs off `BACKOFF_SECS` and retries rather than
-guessing. It never pings blind.
+Failed reads and requests suppress automatic retries for `BACKOFF_SECS`. Explicit
+`ping`/`--force` bypass observation and retry delays, but still require valid window
+data and skip known exhausted quotas. `ping --dry-run` never sends a request.
+
+State version 2 separates last check, last attempt, last successful request, server
+reset, and retry deadline. Old state is discarded because the previous `last_ping`
+also recorded skips. Changing accounts invalidates state. A clock rollback invalidates
+observations while preserving conservative request protection. `status` and dry-run
+are read-only; failed live reads display `UNKNOWN source=stale`, not cached `ACTIVE`.
+
+The Chinese design and verification record is in [docs/窗口保活修复方案.md](docs/窗口保活修复方案.md).
+
+Run the offline tests (no model calls):
+
+```sh
+bash tests/test-decide.sh
+bash tests/test-window-lifecycle.sh
+```
 
 ### The FIFO/stdin constraint
 
@@ -190,8 +215,9 @@ resolution.
 
 ## Troubleshooting
 
-- `status` shows stale numbers (`source=stale`): the live RPC read failed (Codex not
-  signed in, or `codex app-server` errored) and it fell back to the last saved state.
+- `status` shows `UNKNOWN source=stale`: the live RPC read failed (Codex not signed in,
+  or `codex app-server` errored). Saved request history is shown without claiming an
+  active live window.
 - Timer not firing (Linux): `systemctl --user list-timers codex-window-keeper.timer`. If
   the user session is gone after logout, enable lingering (see Requirements).
 - Timer not firing (macOS): `launchctl print gui/$(id -u)/com.matpb.codex-window-keeper`,

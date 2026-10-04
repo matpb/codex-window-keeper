@@ -18,11 +18,10 @@ TIMEOUT_BIN="$(resolve_timeout_bin)"
 
 # Formats an epoch seconds value as local time on both GNU and BSD date.
 fmt_epoch() {
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    date -r "$1" '+%Y-%m-%d %H:%M:%S'
-  else
-    date -d "@$1" '+%Y-%m-%d %H:%M:%S'
+  if date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null; then
+    return 0
   fi
+  date -r "$1" '+%Y-%m-%d %H:%M:%S'
 }
 
 log() {
@@ -52,10 +51,11 @@ account_state_dir() {
   printf '%s/%s' "$STATE_ROOT" "$1"
 }
 
-# Prints the account's CODEX_HOME, or empty for the default account.
+# Resolve the same account directory for reads and requests, including manual commands.
 account_codex_home() {
   local label="$1" var
   if [[ "$label" == "default" ]]; then
+    printf '%s' "${CODEX_HOME_default:-${CODEX_HOME:-$HOME/.codex}}"
     return 0
   fi
   var="CODEX_HOME_$label"
@@ -140,29 +140,153 @@ read_limits() {
   printf '%s\n' "$rate_limits"
 }
 
-write_state() {
-  local label="$1" resets_at="$2" source="$3" used_pct="$4" weekly_used_pct="$5" \
-    weekly_resets_at="$6" plan_type="$7" last_ping_at="$8" last_result="$9" last_error="${10}"
-  local state_dir state_path tmp
-  state_dir="$(account_state_dir "$label")"
+# Local opaque identity: stable through token refresh when account_id is available.
+# File contents are hashed only as a fallback, never logged or stored in state.
+account_key() {
+  local codex_home identity
+  codex_home="$(account_codex_home "$1")"
+  if [[ -d "$codex_home" ]]; then codex_home="$(cd "$codex_home" && pwd -P)"; fi
+  identity="$(jq -r '.tokens.account_id // .account_id // empty' "$codex_home/auth.json" 2>/dev/null || true)"
+  if [[ -z "$identity" ]]; then
+    # No file identity means we cannot safely reuse history (e.g. keychain-only auth).
+    [[ -f "$codex_home/auth.json" ]] || return 0
+    identity="$(cksum < "$codex_home/auth.json")"
+  fi
+  printf '%s\n%s' "$codex_home" "$identity" | cksum | awk '{print $1 ":" $2}'
+}
+
+load_account_state() {
+  local path key="$2" now="$3" saved
+  path="$(account_state_dir "$1")/state.json"
+  saved="$(cat "$path" 2>/dev/null || true)"
+  printf '%s' "${saved:-null}" | jq -c --arg key "$key" --argjson now "$now" \
+    --argjson duration "$WINDOW_SECS" --argjson retry "$((BACKOFF_SECS + PING_TIMEOUT))" '
+    def timestamp: type == "number" and . >= 0 and . == floor;
+    if type == "object" and .version == 2 and $key != "" and .account_key == $key
+      and ([.last_checked_at, .last_ping_at, .last_ping_attempt_at, .retry_after, .unconfirmed_until]
+           | all(.[]; timestamp))
+    then
+      if .last_checked_at > $now then
+        .retry_after = (if .retry_after > .last_checked_at then $now+$retry else 0 end) |
+        .unconfirmed_until = (if .unconfirmed_until > .last_checked_at
+          or (.last_ping_at > 0 and (.confirmed_reset_at // 0) > .last_checked_at)
+          then $now+$duration else 0 end) |
+        .observation=null | .confirmed_reset_at=null | .last_checked_at=$now
+      else . end
+    else empty end' 2>/dev/null || true
+}
+
+empty_state() {
+  jq -cn --arg key "$1" '{version:2, account_key:$key, last_checked_at:0,
+    last_ping_at:0,last_ping_attempt_at:0,retry_after:0,unconfirmed_until:0,
+    confirmed_reset_at:null,observation:null,last_result:"never",last_error:""}'
+}
+
+save_state() {
+  local state_dir tmp
+  state_dir="$(account_state_dir "$1")"
   mkdir -p "$state_dir"
-  state_path="$state_dir/state.json"
-  tmp="$(mktemp "${state_path}.tmp.XXXXXX")"
-  jq -n \
-    --argjson resets_at "$resets_at" \
-    --arg source "$source" \
-    --argjson used_pct "$(numeric_or_null "$used_pct")" \
-    --argjson weekly_used_pct "$(numeric_or_null "$weekly_used_pct")" \
-    --argjson weekly_resets_at "$(numeric_or_null "$weekly_resets_at")" \
-    --arg plan_type "$plan_type" \
-    --argjson last_ping_at "$last_ping_at" \
-    --arg last_result "$last_result" \
-    --arg last_error "$last_error" \
-    '{resets_at:$resets_at,source:$source,used_pct:$used_pct,weekly_used_pct:$weekly_used_pct,
-      weekly_resets_at:$weekly_resets_at,plan_type:(if $plan_type=="" then null else $plan_type end),
-      last_ping_at:$last_ping_at,last_result:$last_result,last_error:$last_error}' \
-    > "$tmp"
-  mv "$tmp" "$state_path"
+  tmp="$(mktemp "$state_dir/state.json.tmp.XXXXXX")"
+  printf '%s\n' "$2" > "$tmp"
+  mv "$tmp" "$state_dir/state.json"
+}
+
+# A pure decision shared by tick, dry-run and status. Comparisons deliberately
+# span normal ticks (5-20 minutes), not two reads of the same short-lived cache.
+classify_limits() {
+  jq -cn --argjson limits "$1" --argjson state "$2" --argjson now "$3" \
+    --argjson force "$4" '
+    def percent: type == "number" and . >= 0 and . <= 100;
+    def epoch: type == "number" and . > 0 and . == floor;
+    def abs: if . < 0 then -. else . end;
+    def verdict($a;$s;$r): {action:$a,window_status:$s,reason:$r,confirmed_reset_at:null};
+    [$limits.primary?, $limits.secondary? | select(type == "object" and .windowDurationMins == 300)] as $windows |
+    [$limits.primary?, $limits.secondary? | select(type == "object" and .windowDurationMins == 10080)] as $weeks |
+    $windows[0] as $w | $weeks[0] as $week |
+    {source:"live",observation:null,resets_at:($w.resetsAt // null),
+     used_pct:($w.usedPercent // null),weekly_used_pct:($week.usedPercent // null),
+     plan_type:($limits.planType // null)} as $base |
+    if ($windows|length) != 1 or ($w.usedPercent|percent|not) or ($w.resetsAt|epoch|not)
+      or (($weeks|length) > 0 and (($week.usedPercent|percent|not) or ($week.resetsAt|epoch|not)))
+    then $base + verdict("backoff";"UNKNOWN";"missing or invalid five-hour/weekly window data")
+    else
+      {at:$now,reset:$w.resetsAt,used:$w.usedPercent,duration:300,
+       limit_id:($limits.limitId // "codex"),plan:($limits.planType // null)} as $obs |
+      $state.observation as $old |
+      ($obs | {duration,limit_id,plan}) as $scope |
+      ($state.window_scope // null) as $prior_scope |
+      ($prior_scope != null and $prior_scope != $scope) as $scope_changed |
+      (try ($old != null and $old.duration == 300 and $old.limit_id == $obs.limit_id
+       and $old.plan == $obs.plan) catch false) as $same_window |
+      (try ($same_window and ($old.at|epoch) and ($old.reset|epoch) and ($old.used|percent)
+       and ($now-$old.at) >= 300 and ($now-$old.at) <= 1200 and $old.reset > $now) catch false) as $comparable |
+      (if $comparable then (($w.resetsAt-$old.reset|abs) <= 60
+        and $w.resetsAt-$now < 17940) else false end) as $fixed |
+      (try ($same_window and $state.confirmed_reset_at > $now
+        and ($w.resetsAt-$state.confirmed_reset_at|abs) <= 60) catch false) as $confirmed |
+      (try ($same_window and $state.last_ping_at > 0
+        and $state.confirmed_reset_at >= $state.last_ping_at
+        and $state.confirmed_reset_at <= $now) catch false) as $known_expired |
+      (if $comparable then ($old.used == 0 and $w.usedPercent == 0
+        and ($old.reset-$old.at-18000|abs) <= 60
+        and ($w.resetsAt-$now-18000|abs) <= 60
+        and ($w.resetsAt-$old.reset-($now-$old.at)|abs) <= 60) else false end) as $sliding |
+      $base + {observation:$obs,window_scope:$scope,scope_changed:$scope_changed} + (
+        if ($week != null and $week.usedPercent >= 100 and $week.resetsAt > $now)
+          or ($w.usedPercent >= 100 and $w.resetsAt > $now)
+          or $limits.spendControlReached == true
+        then verdict("skip";"EXHAUSTED";"quota exhausted; waiting for reset")
+        elif $force == 1 then verdict("ping";"LAPSED";"explicit request") +
+          {confirmed_reset_at:(if $w.resetsAt > $now and ($w.usedPercent > 0 or $fixed or $confirmed)
+            then $w.resetsAt else null end)}
+        elif $w.resetsAt > $now and ($w.usedPercent > 0 or $fixed or $confirmed)
+        then verdict("skip";"ACTIVE";"window active") + {confirmed_reset_at:$w.resetsAt}
+        elif $state.unconfirmed_until > $now and ($known_expired|not) and ($scope_changed|not)
+        then verdict("observe";"UNCONFIRMED";"request completed; awaiting window confirmation, repeat suppressed")
+        elif $w.resetsAt <= $now then verdict("ping";"LAPSED";"window expired")
+        elif $sliding then verdict("ping";"LAPSED";"zero-use reset slides with observation time")
+        else verdict("observe";"OBSERVING";"need another comparable snapshot") end)
+    end'
+}
+
+# Globals are scoped dynamically to the caller. Read-only callers do not persist
+# these observations or change retry timers.
+inspect_account() {
+  local label="$1" force="$2" respect_retry="${3:-1}" limits
+  CHECKED_AT="$(date +%s)"
+  ACCOUNT_KEY="$(account_key "$label")"
+  ACCOUNT_STATE="$(load_account_state "$label" "$ACCOUNT_KEY" "$CHECKED_AT")"
+  [[ -n "$ACCOUNT_STATE" ]] || ACCOUNT_STATE="$(empty_state "$ACCOUNT_KEY")"
+  if [[ "$force" -eq 0 && "$respect_retry" -eq 1 ]] && \
+    (( $(printf '%s' "$ACCOUNT_STATE" | jq -r '.retry_after') > CHECKED_AT )); then
+    DECISION='{"action":"backoff","window_status":"BACKOFF","reason":"retry deadline not reached","source":"stale","observation":null}'
+    return 0
+  fi
+  if limits="$(read_limits "$label")" && printf '%s' "$limits" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    DECISION="$(classify_limits "$limits" "$ACCOUNT_STATE" "$CHECKED_AT" "$force")"
+    if [[ -z "$ACCOUNT_KEY" ]]; then
+      DECISION="$(printf '%s' "$DECISION" | jq -c '. + {action:"backoff",window_status:"UNKNOWN",reason:"account file identity unavailable",observation:null}')"
+    fi
+  else
+    DECISION='{"action":"backoff","window_status":"UNKNOWN","reason":"rate limit read failed","source":"stale","observation":null}'
+  fi
+}
+
+record_decision() {
+  jq -cn --argjson state "$1" --argjson decision "$2" --argjson now "$3" \
+    --argjson backoff "$BACKOFF_SECS" '
+    $state + {last_checked_at:$now,last_result:$decision.action,
+      last_error:(if $decision.action == "backoff" then $decision.reason else "" end),
+      window_status:$decision.window_status,reason:$decision.reason,source:$decision.source,
+      observation:($decision.observation // $state.observation),
+      window_scope:($decision.window_scope // $state.window_scope),
+      confirmed_reset_at:(if $decision.observation == null
+        then $state.confirmed_reset_at else ($decision.confirmed_reset_at // null) end),
+      unconfirmed_until:(if $decision.scope_changed == true or ($decision.confirmed_reset_at // 0) > $now
+        or ($state.last_ping_at > 0 and ($state.confirmed_reset_at // 0) >= $state.last_ping_at
+          and $state.confirmed_reset_at <= $now)
+        then 0 else $state.unconfirmed_until end),
+      retry_after:(if $decision.action == "backoff" then $now+$backoff else 0 end)}'
 }
 
 resets_in_minutes() {
@@ -193,21 +317,9 @@ resets_in_human() {
 
 # Decides ping/skip/backoff for one account without pinging or writing state.
 decide_dry_run() {
-  local label="$1" force="$2" limits resets_at mins now
-  limits="$(read_limits "$label" || true)"
-  if [[ -z "$limits" ]]; then
-    echo "would-backoff $label rate limit read failed"
-    return 0
-  fi
-
-  resets_at="$(printf '%s' "$limits" | jq -r '.primary.resetsAt // empty')"
-  now="$(date +%s)"
-  if [[ "$force" -eq 0 ]] && [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
-    mins="$(resets_in_minutes "$resets_at")"
-    echo "would-skip $label window active, resets in ${mins}m"
-  else
-    echo "would-ping $label"
-  fi
+  local ACCOUNT_KEY ACCOUNT_STATE CHECKED_AT DECISION
+  inspect_account "$1" "$2"
+  printf '%s' "$DECISION" | jq -r --arg label "$1" '"would-\(.action) \($label) \(.reason)"'
 }
 
 # Atomic mkdir-based lock, portable to macOS bash 3.2. Stores the holder's
@@ -241,90 +353,73 @@ release_lock() {
 }
 
 ping_account() {
-  local label="$1" force="$2" state_dir now limits
-  state_dir="$(account_state_dir "$label")"
-  mkdir -p "$state_dir"
-
+  local label="$1" force="$2" ACCOUNT_KEY ACCOUNT_STATE CHECKED_AT DECISION
+  local action reason state ping_out ping_rc codex_home after limits2 post decision_key
   if ! acquire_lock "$label"; then
     log "skip $label locked (another run in progress)"
     return 0
   fi
-  # Crash safety net: the pid check in acquire_lock recovers a stale lock
-  # even if this trap never fires (e.g. SIGKILL).
-  # shellcheck disable=SC2064 # intentional: bind label's value now, not at trap time
+  # shellcheck disable=SC2064
   trap "release_lock '$label'" EXIT
-
-  now="$(date +%s)"
-  limits="$(read_limits "$label" || true)"
-
-  if [[ -z "$limits" ]]; then
-    write_state "$label" "$((now + BACKOFF_SECS))" backoff null null null "" "$now" rpc-error "rate limit read failed"
-    log "backoff $label rate limit read failed"
-    release_lock "$label"
-    trap - EXIT
-    return 0
+  inspect_account "$label" "$force"
+  action="$(printf '%s' "$DECISION" | jq -r '.action')"
+  reason="$(printf '%s' "$DECISION" | jq -r '.reason')"
+  if [[ "$reason" == "retry deadline not reached" ]]; then
+    # Persist a clock-rebased deadline once; otherwise every tick extends it.
+    save_state "$label" "$ACCOUNT_STATE"
+    log "backoff $label $reason"
+    release_lock "$label"; trap - EXIT; return 0
+  fi
+  state="$(record_decision "$ACCOUNT_STATE" "$DECISION" "$CHECKED_AT")"
+  save_state "$label" "$state"
+  if [[ "$action" != "ping" ]]; then
+    log "$action $label $reason $(printf '%s' "$DECISION" | jq -c '{observed:.observation.at,reset:.observation.reset,used:.observation.used,status:.window_status}')"
+    release_lock "$label"; trap - EXIT; return 0
   fi
 
-  local resets_at used_pct weekly_used_pct weekly_resets_at plan_type
-  resets_at="$(printf '%s' "$limits" | jq -r '.primary.resetsAt // empty')"
-  used_pct="$(printf '%s' "$limits" | jq -r '.primary.usedPercent // empty')"
-  weekly_used_pct="$(printf '%s' "$limits" | jq -r '.secondary.usedPercent // empty')"
-  weekly_resets_at="$(printf '%s' "$limits" | jq -r '.secondary.resetsAt // empty')"
-  plan_type="$(printf '%s' "$limits" | jq -r '.planType // empty')"
-
-  if [[ "$force" -eq 0 ]] && [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
-    write_state "$label" "$resets_at" rpc "$used_pct" "$weekly_used_pct" "$weekly_resets_at" "$plan_type" "$now" skip ""
-    local mins
-    mins="$(resets_in_minutes "$resets_at")"
-    log "skip $label window active, resets in ${mins}m"
-    release_lock "$label"
-    trap - EXIT
-    return 0
+  # Auth may have changed during the read. Never spend against a different
+  # identity than the one whose state authorized the request.
+  decision_key="$(account_key "$label")"
+  if [[ "$decision_key" != "$ACCOUNT_KEY" ]]; then
+    log "observe $label account changed during read"
+    release_lock "$label"; trap - EXIT; return 0
   fi
-
-  local codex_home env_args=() ping_out ping_rc
   codex_home="$(account_codex_home "$label")"
-  if [[ -n "$codex_home" ]]; then
-    env_args=("CODEX_HOME=$codex_home")
-  fi
-
-  set +e
-  ping_out="$("$TIMEOUT_BIN" "$PING_TIMEOUT" env "${env_args[@]+"${env_args[@]}"}" "$CODEX_BIN" exec \
+  state="$(printf '%s' "$state" | jq -c --argjson now "$CHECKED_AT" --argjson guard "$((PING_TIMEOUT + BACKOFF_SECS))" \
+    '. + {last_ping_attempt_at:$now,last_result:"ping-started",retry_after:($now+$guard)}')"
+  save_state "$label" "$state"
+  log "ping $label start reason=$reason"
+  if ping_out="$("$TIMEOUT_BIN" "$PING_TIMEOUT" env "CODEX_HOME=$codex_home" "$CODEX_BIN" exec \
     --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check \
     -s read-only -m "$MODEL" -c "model_reasoning_effort=$REASONING_EFFORT" --json \
-    "$PROMPT" < /dev/null 2>/dev/null)"
-  ping_rc=$?
-  set -e
-
-  if [[ "$ping_rc" -ne 0 ]] || ! printf '%s' "$ping_out" | grep -q '"type":"turn.completed"'; then
-    write_state "$label" "$((now + BACKOFF_SECS))" backoff null null null "" "$now" error "ping failed (rc=$ping_rc)"
-    log "ping $label failed rc=$ping_rc"
-    release_lock "$label"
-    trap - EXIT
-    return 0
+    "$PROMPT" < /dev/null 2>/dev/null)"; then ping_rc=0; else ping_rc=$?; fi
+  after="$(date +%s)"
+  if [[ "$ping_rc" -ne 0 ]] || ! printf '%s' "$ping_out" | jq -es 'any(.[]; .type? == "turn.completed")' >/dev/null 2>&1; then
+    state="$(printf '%s' "$state" | jq -c --argjson now "$after" --argjson retry "$BACKOFF_SECS" --arg err "ping failed (rc=$ping_rc)" \
+      '. + {last_result:"error",last_error:$err,window_status:"UNKNOWN",retry_after:($now+$retry)}')"
+    save_state "$label" "$state"
+    log "ping $label failed rc=$ping_rc retry_after=$((after + BACKOFF_SECS))"
+    release_lock "$label"; trap - EXIT; return 0
   fi
 
-  local limits2 resets_at2 used_pct2 weekly_used_pct2 weekly_resets_at2 plan_type2
-  limits2="$(read_limits "$label" || true)"
-  if [[ -n "$limits2" ]]; then
-    resets_at2="$(printf '%s' "$limits2" | jq -r '.primary.resetsAt // empty')"
-    if [[ "$resets_at2" =~ ^[0-9]+$ ]] && (( resets_at2 > now )); then
-      used_pct2="$(printf '%s' "$limits2" | jq -r '.primary.usedPercent // empty')"
-      weekly_used_pct2="$(printf '%s' "$limits2" | jq -r '.secondary.usedPercent // empty')"
-      weekly_resets_at2="$(printf '%s' "$limits2" | jq -r '.secondary.resetsAt // empty')"
-      plan_type2="$(printf '%s' "$limits2" | jq -r '.planType // empty')"
-      write_state "$label" "$resets_at2" rpc "$used_pct2" "$weekly_used_pct2" "$weekly_resets_at2" "$plan_type2" "$now" ok ""
-      log "ping $label ok resets_at=$(fmt_epoch "$resets_at2") source=rpc"
-      release_lock "$label"
-      trap - EXIT
-      return 0
-    fi
+  # Save completion BEFORE the post-read, so an interrupted read cannot trigger
+  # another successful request on the next tick.
+  state="$(printf '%s' "$state" | jq -c --argjson now "$after" --argjson duration "$WINDOW_SECS" \
+    '. + {last_ping_at:$now,last_result:"ping-unconfirmed",last_error:"",window_status:"UNCONFIRMED",
+          retry_after:0,unconfirmed_until:($now+$duration)}')"
+  save_state "$label" "$state"
+  if limits2="$(read_limits "$label")" && printf '%s' "$limits2" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    post="$(date +%s)"
+    DECISION="$(classify_limits "$limits2" "$state" "$post" 0)"
+    state="$(record_decision "$state" "$DECISION" "$post")"
   fi
-
-  write_state "$label" "$((now + WINDOW_SECS))" assumed null null null "" "$now" ping-ok-read-failed "post-ping rate limit read failed"
-  log "ping $label ok source=assumed (post-ping read failed)"
-  release_lock "$label"
-  trap - EXIT
+  state="$(printf '%s' "$state" | jq -c --argjson now "$after" '
+    .retry_after=0 | if (.confirmed_reset_at // 0) > $now
+    then .last_result="ok" | .window_status="ACTIVE" | .unconfirmed_until=0
+    else .last_result="ping-unconfirmed" | .window_status="UNCONFIRMED" end')"
+  save_state "$label" "$state"
+  log "ping $label completed $(printf '%s' "$state" | jq -c '{status:.window_status,reset:.observation.reset,confirmed_reset:.confirmed_reset_at}')"
+  release_lock "$label"; trap - EXIT
 }
 
 # Checks deps. mode "read" (status, dry-run) covers what read_limits needs;
@@ -373,64 +468,29 @@ run_tick() {
 }
 
 run_status() {
-  local account="$1" labels label
+  local account="$1" labels label ACCOUNT_KEY ACCOUNT_STATE CHECKED_AT DECISION
   labels="${account:-$ACCOUNTS}"
   account_list_array "$labels"
-
   for label in "${ACCOUNT_LIST[@]+"${ACCOUNT_LIST[@]}"}"; do
-    local state_path limits source
-    state_path="$(account_state_dir "$label")/state.json"
-    limits="$(read_limits "$label" || true)"
-
-    local resets_at used_pct weekly_used_pct plan_type last_ping_at last_result
-    if [[ -n "$limits" ]]; then
-      resets_at="$(printf '%s' "$limits" | jq -r '.primary.resetsAt // empty')"
-      used_pct="$(printf '%s' "$limits" | jq -r '.primary.usedPercent // empty')"
-      weekly_used_pct="$(printf '%s' "$limits" | jq -r '.secondary.usedPercent // empty')"
-      plan_type="$(printf '%s' "$limits" | jq -r '.planType // empty')"
-      source="live"
-      last_ping_at=""
-      last_result=""
-      if [[ -f "$state_path" ]]; then
-        last_ping_at="$(jq -r '.last_ping_at // empty' "$state_path")"
-        last_result="$(jq -r '.last_result // empty' "$state_path")"
-      fi
-    elif [[ -f "$state_path" ]]; then
-      resets_at="$(jq -r '.resets_at // empty' "$state_path")"
-      used_pct="$(jq -r '.used_pct // empty' "$state_path")"
-      weekly_used_pct="$(jq -r '.weekly_used_pct // empty' "$state_path")"
-      plan_type="$(jq -r '.plan_type // empty' "$state_path")"
-      last_ping_at="$(jq -r '.last_ping_at // empty' "$state_path")"
-      last_result="$(jq -r '.last_result // empty' "$state_path")"
-      source="stale"
-    else
-      printf '%-10s %s\n' "$label" "UNKNOWN"
-      continue
+    inspect_account "$label" 0 0
+    local state resets used weekly plan source last_ping result reason resets_local countdown ping_local
+    state="$(printf '%s' "$DECISION" | jq -r '.window_status')"
+    source="$(printf '%s' "$DECISION" | jq -r '.source')"
+    resets="$(printf '%s' "$DECISION" | jq -r '.resets_at // empty')"
+    used="$(printf '%s' "$DECISION" | jq -r '.used_pct // "-"')"
+    weekly="$(printf '%s' "$DECISION" | jq -r '.weekly_used_pct // "-"')"
+    plan="$(printf '%s' "$DECISION" | jq -r '.plan_type // "-"')"
+    last_ping="$(printf '%s' "$ACCOUNT_STATE" | jq -r '.last_ping_at')"
+    result="$(printf '%s' "$ACCOUNT_STATE" | jq -r '.last_result')"
+    reason="$(printf '%s' "$DECISION" | jq -r '.reason')"
+    resets_local="-"; countdown="-"; ping_local="-"
+    if [[ "$resets" =~ ^[0-9]+$ ]]; then
+      resets_local="$(fmt_epoch "$resets")"
+      countdown="$(resets_in_human "$resets")"
     fi
-
-    local now state resets_local countdown last_ping_local
-    now="$(date +%s)"
-    if [[ -n "$resets_at" ]] && [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
-      state="ACTIVE"
-    else
-      state="LAPSED"
-    fi
-
-    resets_local="-"
-    countdown="-"
-    if [[ -n "$resets_at" && "$resets_at" != "null" ]]; then
-      resets_local="$(fmt_epoch "$resets_at")"
-      countdown="$(resets_in_human "$resets_at")"
-    fi
-
-    last_ping_local="-"
-    if [[ -n "$last_ping_at" && "$last_ping_at" != "null" ]]; then
-      last_ping_local="$(fmt_epoch "$last_ping_at")"
-    fi
-
-    printf '%-10s %-8s resets=%s (%s) used_pct=%s weekly_pct=%s plan=%s source=%s last_ping=%s last_result=%s\n' \
-      "$label" "$state" "$resets_local" "$countdown" "${used_pct:--}" "${weekly_used_pct:--}" \
-      "${plan_type:--}" "$source" "$last_ping_local" "${last_result:--}"
+    if (( last_ping > 0 )); then ping_local="$(fmt_epoch "$last_ping")"; fi
+    printf '%-10s %-11s resets=%s (%s) used_pct=%s weekly_pct=%s plan=%s source=%s last_ping=%s last_result=%s reason=%s\n' \
+      "$label" "$state" "$resets_local" "$countdown" "$used" "$weekly" "$plan" "$source" "$ping_local" "$result" "$reason"
   done
 }
 
@@ -468,7 +528,7 @@ main() {
     ping)
       load_config
       require_deps full
-      run_tick 1 0 "$account"
+      run_tick 1 "$dry_run" "$account"
       ;;
     status)
       load_config
