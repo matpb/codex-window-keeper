@@ -154,13 +154,15 @@ confirmed, the real reset time takes precedence, including an earlier expiry.
 
 Failed reads and requests suppress automatic retries for `BACKOFF_SECS`. Explicit
 `ping`/`--force` bypass observation and retry delays, but still require valid window
-data and skip known exhausted quotas. `ping --dry-run` never sends a request.
+data and skip known exhausted quotas, including backend-reported and individual limits.
+`ping --dry-run` never sends a request.
 
 State version 2 separates last check, last attempt, last successful request, server
 reset, and retry deadline. Old state is discarded because the previous `last_ping`
 also recorded skips. Changing accounts invalidates state. A clock rollback invalidates
 observations while preserving conservative request protection. `status` and dry-run
 are read-only; failed live reads display `UNKNOWN source=stale`, not cached `ACTIVE`.
+Damaged optional state fields are discarded without discarding a valid recent request guard.
 
 The Chinese design and verification record is in [docs/窗口保活修复方案.md](docs/窗口保活修复方案.md).
 

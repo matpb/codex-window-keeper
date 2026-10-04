@@ -66,14 +66,6 @@ account_codex_home() {
   printf '%s' "${!var}"
 }
 
-numeric_or_null() {
-  if [[ -z "$1" || "$1" == "null" ]]; then
-    printf 'null'
-  else
-    printf '%s' "$1"
-  fi
-}
-
 # Free RPC read of account/rateLimits/read. Prints .result.rateLimits and
 # returns 0 on success, prints nothing and returns 1 on any failure.
 #
@@ -162,10 +154,20 @@ load_account_state() {
   printf '%s' "${saved:-null}" | jq -c --arg key "$key" --argjson now "$now" \
     --argjson duration "$WINDOW_SECS" --argjson retry "$((BACKOFF_SECS + PING_TIMEOUT))" '
     def timestamp: type == "number" and . >= 0 and . == floor;
+    def valid_scope: type == "object" and .duration == 300
+      and (.limit_id | type == "string" or . == null)
+      and (.plan | type == "string" or . == null);
+    def valid_observation: type == "object" and (.at | timestamp)
+      and (.reset | timestamp) and (.used | type == "number" and . >= 0 and . <= 100)
+      and .duration == 300 and (.limit_id | type == "string" or . == null)
+      and (.plan | type == "string" or . == null);
     if type == "object" and .version == 2 and $key != "" and .account_key == $key
       and ([.last_checked_at, .last_ping_at, .last_ping_attempt_at, .retry_after, .unconfirmed_until]
            | all(.[]; timestamp))
     then
+      .window_scope = (if (.window_scope | valid_scope) then .window_scope else null end) |
+      .observation = (if (.observation | valid_observation) then .observation else null end) |
+      .confirmed_reset_at = (if (.confirmed_reset_at | timestamp) then .confirmed_reset_at else null end) |
       if .last_checked_at > $now then
         .retry_after = (if .retry_after > .last_checked_at then $now+$retry else 0 end) |
         .unconfirmed_until = (if .unconfirmed_until > .last_checked_at
@@ -234,7 +236,10 @@ classify_limits() {
       $base + {observation:$obs,window_scope:$scope,scope_changed:$scope_changed} + (
         if ($week != null and $week.usedPercent >= 100 and $week.resetsAt > $now)
           or ($w.usedPercent >= 100 and $w.resetsAt > $now)
-          or $limits.spendControlReached == true
+          or $limits.rateLimitReachedType != null
+          or (($limits.individualLimit.remainingPercent | type) == "number"
+            and $limits.individualLimit.remainingPercent <= 0
+            and $limits.individualLimit.resetsAt > $now)
         then verdict("skip";"EXHAUSTED";"quota exhausted; waiting for reset")
         elif $force == 1 then verdict("ping";"LAPSED";"explicit request") +
           {confirmed_reset_at:(if $w.resetsAt > $now and ($w.usedPercent > 0 or $fixed or $confirmed)
@@ -287,14 +292,6 @@ record_decision() {
           and $state.confirmed_reset_at <= $now)
         then 0 else $state.unconfirmed_until end),
       retry_after:(if $decision.action == "backoff" then $now+$backoff else 0 end)}'
-}
-
-resets_in_minutes() {
-  local resets_at="$1" now diff
-  now="$(date +%s)"
-  diff=$(( resets_at - now ))
-  (( diff < 0 )) && diff=0
-  echo $(( diff / 60 ))
 }
 
 resets_in_human() {

@@ -13,11 +13,6 @@ limits() {
 }
 tick() { (ping_account default 0); }
 force_ping() { (ping_account default 1); }
-read_limits() {
-  echo read >> "$TEST_ROOT/reads"
-  [[ ! -f "$TEST_ROOT/read-fails" ]] || return 1
-  cat "$TEST_ROOT/limits"
-}
 date() {
   if [[ "$1" == '+%s' ]]; then printf '%s\n' "$TEST_NOW"; else command date "$@"; fi
 }
@@ -131,6 +126,28 @@ test_invalid_and_exhausted() {
   done
   assert_eq "$(count pings)" 0 'invalid or exhausted data must not spend even with force'
 }
+test_backend_exhaustion() {
+  limits 0 1999999900
+  jq '.rateLimitReachedType="workspace_member_usage_limit_reached"' "$TEST_ROOT/limits" > "$TEST_ROOT/changed"
+  mv "$TEST_ROOT/changed" "$TEST_ROOT/limits"
+  tick; force_ping
+  assert_eq "$(count pings)" 0 'backend-reported quota exhaustion blocks automatic and forced requests'
+
+  limits 0 1999999900
+  jq '.individualLimit={limit:"100",used:"100",remainingPercent:0,resetsAt:2000500000}' "$TEST_ROOT/limits" > "$TEST_ROOT/changed"
+  mv "$TEST_ROOT/changed" "$TEST_ROOT/limits"
+  tick; force_ping
+  assert_eq "$(count pings)" 0 'individual spend limit blocks automatic and forced requests'
+}
+test_damaged_state_guard() {
+  limits 0 2000018000; tick
+  TEST_NOW=2000000600; limits 0 2000018600; tick
+  jq '.window_scope="broken"' \
+    "$STATE_ROOT/default/state.json" > "$TEST_ROOT/changed"
+  mv "$TEST_ROOT/changed" "$STATE_ROOT/default/state.json"
+  TEST_NOW=2000001200; limits 0 2000019200; tick
+  assert_eq "$(count pings)" 1 'damaged optional state must preserve successful-request guard'
+}
 test_history_invalidation() {
   limits 0 2000018000; tick
   printf '{"auth_mode":"chatgpt","tokens":{"account_id":"account-b"}}\n' > "$TEST_ROOT/account/auth.json"
@@ -241,7 +258,7 @@ test_unconfirmed_bucket_change() {
 }
 
 failed=0
-for case_name in sliding fixed_zero rpc_backoff ping_backoff success_cap confirmed_early_expiry window_switch invalid_and_exhausted history_invalidation legacy_and_readonly stale_and_date lock clock_after_success cached_then_sliding secondary_and_corrupt_state ping_dry_run bucket_change clock_backoff_deadline force_post_read_failure force_post_read_invalid unconfirmed_bucket_change; do
+for case_name in sliding fixed_zero rpc_backoff ping_backoff success_cap confirmed_early_expiry window_switch invalid_and_exhausted backend_exhaustion damaged_state_guard history_invalidation legacy_and_readonly stale_and_date lock clock_after_success cached_then_sliding secondary_and_corrupt_state ping_dry_run bucket_change clock_backoff_deadline force_post_read_failure force_post_read_invalid unconfirmed_bucket_change; do
   # Deliberately not an if/|| function invocation: preserve errexit in each case.
   set +e
   (set -e; setup "$case_name"; "test_$case_name")
