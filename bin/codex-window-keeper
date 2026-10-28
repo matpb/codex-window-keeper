@@ -191,9 +191,27 @@ resets_in_human() {
   fi
 }
 
+# An unused window can report 0% and a reset synthesized as now + its full
+# duration. A future reset alone is therefore not proof that a window started.
+# Use the time just before the RPC read so latency cannot make that placeholder
+# look like an elapsed window. Keep zero-percent windows whose countdown has
+# started: a successful cheap ping can remain below the API's 1% resolution.
+primary_window_active() {
+  local resets_at="$1" used_pct="$2" duration_mins="$3" read_started_at="$4" now
+  now="$(date +%s)"
+  [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )) || return 1
+
+  if [[ "$used_pct" == "0" && "$duration_mins" =~ ^[1-9][0-9]*$ ]] && \
+    (( resets_at >= read_started_at + duration_mins * 60 )); then
+    return 1
+  fi
+  return 0
+}
+
 # Decides ping/skip/backoff for one account without pinging or writing state.
 decide_dry_run() {
-  local label="$1" force="$2" limits resets_at mins now
+  local label="$1" force="$2" limits resets_at used_pct duration_mins mins now
+  now="$(date +%s)"
   limits="$(read_limits "$label" || true)"
   if [[ -z "$limits" ]]; then
     echo "would-backoff $label rate limit read failed"
@@ -201,8 +219,9 @@ decide_dry_run() {
   fi
 
   resets_at="$(printf '%s' "$limits" | jq -r '.primary.resetsAt // empty')"
-  now="$(date +%s)"
-  if [[ "$force" -eq 0 ]] && [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
+  used_pct="$(printf '%s' "$limits" | jq -r '.primary.usedPercent // empty')"
+  duration_mins="$(printf '%s' "$limits" | jq -r '.primary.windowDurationMins // empty')"
+  if [[ "$force" -eq 0 ]] && primary_window_active "$resets_at" "$used_pct" "$duration_mins" "$now"; then
     mins="$(resets_in_minutes "$resets_at")"
     echo "would-skip $label window active, resets in ${mins}m"
   else
@@ -265,14 +284,15 @@ ping_account() {
     return 0
   fi
 
-  local resets_at used_pct weekly_used_pct weekly_resets_at plan_type
+  local resets_at used_pct duration_mins weekly_used_pct weekly_resets_at plan_type
   resets_at="$(printf '%s' "$limits" | jq -r '.primary.resetsAt // empty')"
   used_pct="$(printf '%s' "$limits" | jq -r '.primary.usedPercent // empty')"
+  duration_mins="$(printf '%s' "$limits" | jq -r '.primary.windowDurationMins // empty')"
   weekly_used_pct="$(printf '%s' "$limits" | jq -r '.secondary.usedPercent // empty')"
   weekly_resets_at="$(printf '%s' "$limits" | jq -r '.secondary.resetsAt // empty')"
   plan_type="$(printf '%s' "$limits" | jq -r '.planType // empty')"
 
-  if [[ "$force" -eq 0 ]] && [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
+  if [[ "$force" -eq 0 ]] && primary_window_active "$resets_at" "$used_pct" "$duration_mins" "$now"; then
     write_state "$label" "$resets_at" rpc "$used_pct" "$weekly_used_pct" "$weekly_resets_at" "$plan_type" "$now" skip ""
     local mins
     mins="$(resets_in_minutes "$resets_at")"
@@ -304,12 +324,14 @@ ping_account() {
     return 0
   fi
 
-  local limits2 resets_at2 used_pct2 weekly_used_pct2 weekly_resets_at2 plan_type2
+  local limits2 resets_at2 used_pct2 duration_mins2 weekly_used_pct2 weekly_resets_at2 plan_type2 read_started_at2
+  read_started_at2="$(date +%s)"
   limits2="$(read_limits "$label" || true)"
   if [[ -n "$limits2" ]]; then
     resets_at2="$(printf '%s' "$limits2" | jq -r '.primary.resetsAt // empty')"
-    if [[ "$resets_at2" =~ ^[0-9]+$ ]] && (( resets_at2 > now )); then
-      used_pct2="$(printf '%s' "$limits2" | jq -r '.primary.usedPercent // empty')"
+    used_pct2="$(printf '%s' "$limits2" | jq -r '.primary.usedPercent // empty')"
+    duration_mins2="$(printf '%s' "$limits2" | jq -r '.primary.windowDurationMins // empty')"
+    if primary_window_active "$resets_at2" "$used_pct2" "$duration_mins2" "$read_started_at2"; then
       weekly_used_pct2="$(printf '%s' "$limits2" | jq -r '.secondary.usedPercent // empty')"
       weekly_resets_at2="$(printf '%s' "$limits2" | jq -r '.secondary.resetsAt // empty')"
       plan_type2="$(printf '%s' "$limits2" | jq -r '.planType // empty')"
@@ -378,14 +400,16 @@ run_status() {
   account_list_array "$labels"
 
   for label in "${ACCOUNT_LIST[@]+"${ACCOUNT_LIST[@]}"}"; do
-    local state_path limits source
+    local state_path limits source now
     state_path="$(account_state_dir "$label")/state.json"
+    now="$(date +%s)"
     limits="$(read_limits "$label" || true)"
 
-    local resets_at used_pct weekly_used_pct plan_type last_ping_at last_result
+    local resets_at used_pct weekly_used_pct plan_type last_ping_at last_result duration_mins=""
     if [[ -n "$limits" ]]; then
       resets_at="$(printf '%s' "$limits" | jq -r '.primary.resetsAt // empty')"
       used_pct="$(printf '%s' "$limits" | jq -r '.primary.usedPercent // empty')"
+      duration_mins="$(printf '%s' "$limits" | jq -r '.primary.windowDurationMins // empty')"
       weekly_used_pct="$(printf '%s' "$limits" | jq -r '.secondary.usedPercent // empty')"
       plan_type="$(printf '%s' "$limits" | jq -r '.planType // empty')"
       source="live"
@@ -408,12 +432,14 @@ run_status() {
       continue
     fi
 
-    local now state resets_local countdown last_ping_local
-    now="$(date +%s)"
-    if [[ -n "$resets_at" ]] && [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
+    local state resets_local countdown last_ping_local
+    if primary_window_active "$resets_at" "$used_pct" "$duration_mins" "$now"; then
       state="ACTIVE"
     else
       state="LAPSED"
+      if [[ "$resets_at" =~ ^[0-9]+$ ]] && (( resets_at > now )); then
+        resets_at=""
+      fi
     fi
 
     resets_local="-"

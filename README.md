@@ -146,6 +146,13 @@ current rate limits. If a primary window is active, it skips. Otherwise it:
 If the RPC read itself fails, the keeper backs off `BACKOFF_SECS` and retries rather than
 guessing. It never pings blind.
 
+An unused window can report `usedPercent: 0` with `resetsAt` recalculated as the current
+time plus `windowDurationMins`, rather than a null or expired reset. The keeper treats
+this full-length, zero-percent window as lapsed. It compares against the time before the
+RPC read so read latency cannot make the placeholder look active. A zero-percent window
+whose countdown has already started still counts as active: a cheap ping can use less
+than the API's 1% display resolution.
+
 ### The FIFO/stdin constraint
 
 `codex app-server` speaks JSON-RPC over stdin/stdout and answers asynchronously — a plain
